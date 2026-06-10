@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Curve of Growth &amp; S/N Explorer</title>
+<style>
+  :root{
+    --bg:#ffffff; --txt:#2C2C2A; --muted:#5F5E5A; --hint:#888780;
+    --surface:#F1EFE8; --border:rgba(0,0,0,0.15);
+    --ok:#0F6E56;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#1a1a18; --txt:#F1EFE8; --muted:#B4B2A9; --hint:#888780;
+      --surface:#2C2C2A; --border:rgba(255,255,255,0.18);
+      --ok:#5DCAA5;
+    }
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; background:var(--bg); color:var(--txt);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+    display:flex; justify-content:center; padding:2rem 1rem; min-height:100vh;
+  }
+  .wrap{width:min(760px,100%);}
+  h1{font-size:20px; font-weight:500; margin:0 0 0.4rem; text-align:center;}
+  .sub{font-size:13px; color:var(--muted); text-align:center; margin:0 0 1.5rem;}
+  .cards{display:flex; gap:12px; margin:0 0 1rem; flex-wrap:wrap;}
+  .card{background:var(--surface); border-radius:8px; padding:0.75rem 1rem; flex:1; min-width:120px;}
+  .card .lab{font-size:13px; color:var(--muted);}
+  .card .val{font-size:22px; font-weight:500;}
+  .card .note{font-size:12px; color:var(--hint);}
+  .ctl{display:flex; align-items:center; gap:12px; margin:0 0 1.25rem;}
+  .ctl label{font-size:14px; color:var(--muted); min-width:54px;}
+  input[type=range]{flex:1; accent-color:#BA7517; height:4px; cursor:pointer;}
+  .out{font-size:14px; font-weight:500; min-width:42px; text-align:right;}
+  .grid{display:grid; grid-template-columns:1fr 1fr; gap:14px; align-items:start;}
+  .caption{font-size:12px; color:var(--hint); margin-bottom:4px; text-align:center;}
+  canvas.star{width:100%; height:auto; border-radius:8px; display:block;}
+  canvas.plot{width:100%; height:auto; display:block;}
+  .legend{display:flex; gap:14px; justify-content:center; font-size:12px; color:var(--muted); margin-top:10px; flex-wrap:wrap;}
+  .legend span{display:flex; align-items:center; gap:5px;}
+  @media (max-width:520px){ .grid{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Curve of growth &amp; signal-to-noise</h1>
+  <p class="sub">Drag the aperture radius on a simulated star. Watch the enclosed flux climb while S/N peaks and then falls.</p>
+
+  <div class="cards">
+    <div class="card"><div class="lab">enclosed flux</div><div class="val" id="m-flux">0 e⁻</div><div class="note" id="m-fluxpct">0% of total</div></div>
+    <div class="card"><div class="lab">signal-to-noise</div><div class="val" id="m-snr">0</div><div class="note" id="m-snrnote">&nbsp;</div></div>
+    <div class="card"><div class="lab">aperture radius</div><div class="val" id="m-rad">5 px</div><div class="note" id="m-fwhm">&nbsp;</div></div>
+  </div>
+
+  <div class="ctl">
+    <label for="rad">radius</label>
+    <input type="range" id="rad" min="1" max="24" value="5" step="1">
+    <span class="out" id="rad-out">5 px</span>
+  </div>
+
+  <div class="grid">
+    <div>
+      <div class="caption">simulated star + sky annulus</div>
+      <canvas id="starcv" class="star" width="280" height="280"></canvas>
+    </div>
+    <div>
+      <div class="caption">curve of growth &amp; S/N</div>
+      <canvas id="plotcv" class="plot" width="280" height="280"></canvas>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span><span style="width:14px;height:14px;border:2px solid #3DD4FF;border-radius:50%;"></span>aperture</span>
+    <span><span style="width:14px;height:14px;border:1.5px solid #F0C000;border-radius:50%;"></span>sky annulus</span>
+    <span><span style="width:14px;height:0;border-top:2.5px solid #378ADD;"></span>flux</span>
+    <span><span style="width:14px;height:0;border-top:2.5px solid #BA7517;"></span>S/N</span>
+  </div>
+</div>
+
+<script>
+(function(){
+  var radEl=document.getElementById('rad'), radOut=document.getElementById('rad-out');
+  var starcv=document.getElementById('starcv'), plotcv=document.getElementById('plotcv');
+
+  // --- detector / source parameters (matches the notebook) ---
+  var gain=1.76, readNoise=1.7, skyE=120.0, starFluxE=4.0e4, fwhm=11.0;
+  var sigma=fwhm/2.3548;
+  var VIEW=46;               // half-size of displayed field (px)
+  var x0=0.3, y0=-0.2;       // sub-pixel star offset
+  var rInner=30, rOuter=40;  // sky annulus
+  var nSky=Math.PI*(rOuter*rOuter - rInner*rInner);
+
+  function enclosedFrac(r){ return 1 - Math.exp(-(r*r)/(2*sigma*sigma)); }
+
+  var NP=24;
+  var radii=[], cog=[], snr=[];
+  var Be=skyE;
+  for(var r=1;r<=NP;r++){
+    var S=starFluxE*enclosedFrac(r);
+    var nPix=Math.PI*r*r;
+    // CCD equation, all in electrons:
+    // source + sky-in-aperture*(1 + n_pix/n_sky) + read noise per pixel
+    var varr=S + nPix*Be*(1+nPix/nSky) + nPix*readNoise*readNoise;
+    radii.push(r); cog.push(S); snr.push(S/Math.sqrt(varr));
+  }
+  var plateau=starFluxE;
+  var bestI=0; for(var i=1;i<snr.length;i++) if(snr[i]>snr[bestI]) bestI=i;
+  var snrMax=snr[bestI];
+  var cogMax=Math.max.apply(null,cog);
+
+  function cssvar(n,f){var v=getComputedStyle(document.documentElement).getPropertyValue(n).trim();return v||f;}
+
+  var GAMMA=0.45, grid=2*VIEW;
+  // precompute a fixed Gaussian noise field (Box-Muller) so texture is stable & stripe-free
+  var noiseField=new Float32Array(grid*grid);
+  (function(){
+    var s=123456789;
+    function rnd(){ s=(s*1103515245+12345)&0x7fffffff; return s/0x7fffffff; }
+    for(var k=0;k<noiseField.length;k++){
+      var u1=Math.max(1e-9,rnd()), u2=rnd();
+      noiseField[k]=Math.sqrt(-2*Math.log(u1))*Math.cos(2*Math.PI*u2);
+    }
+  })();
+
+  function drawStar(rad){
+    var ctx=starcv.getContext('2d');
+    var W=starcv.width,H=starcv.height, cell=W/grid;
+    var peakVal=starFluxE/(2*Math.PI*sigma*sigma)+skyE;
+    for(var iy=0;iy<grid;iy++){
+      for(var ix=0;ix<grid;ix++){
+        var px=ix-VIEW - x0, py=iy-VIEW - y0;
+        var val=starFluxE/(2*Math.PI*sigma*sigma)*Math.exp(-(px*px+py*py)/(2*sigma*sigma)) + skyE;
+        val += noiseField[iy*grid+ix]*Math.sqrt(Math.max(1,val));
+        var frac=Math.max(0,Math.min(1,(val - skyE*0.4)/(peakVal - skyE*0.4)));
+        var v=Math.max(0,Math.min(255, 255*Math.pow(frac,GAMMA)));
+        ctx.fillStyle='rgb('+(v|0)+','+(v|0)+','+(v|0)+')';
+        ctx.fillRect(ix*cell, iy*cell, cell+1, cell+1);
+      }
+    }
+    var cx=W/2 + x0*cell, cy=H/2 + y0*cell;
+    ctx.beginPath(); ctx.arc(cx,cy,rad*cell,0,2*Math.PI);
+    ctx.strokeStyle='#3DD4FF'; ctx.lineWidth=2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx,cy,rInner*cell,0,2*Math.PI);
+    ctx.strokeStyle='#F0C000'; ctx.lineWidth=1.4; ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx,cy,rOuter*cell,0,2*Math.PI); ctx.stroke();
+  }
+
+  function drawPlot(rad){
+    var ctx=plotcv.getContext('2d');
+    var W=plotcv.width,H=plotcv.height;
+    ctx.clearRect(0,0,W,H);
+    var padL=8,padT=14,padB=24;
+    var pw=W-padL-8, ph=H-padT-padB;
+    var txt=cssvar('--hint','#999'), border=cssvar('--border','rgba(0,0,0,0.15)');
+    ctx.strokeStyle=border; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(padL,padT+ph); ctx.lineTo(padL+pw,padT+ph); ctx.stroke();
+    var xOf=function(r){return padL + (r-1)/(NP-1)*pw;};
+    var yCog=function(v){return padT + ph - (v/cogMax)*ph;};
+    ctx.strokeStyle='#378ADD'; ctx.lineWidth=2.5; ctx.beginPath();
+    for(var i=0;i<radii.length;i++){var X=xOf(radii[i]),Y=yCog(cog[i]); i?ctx.lineTo(X,Y):ctx.moveTo(X,Y);}
+    ctx.stroke();
+    ctx.strokeStyle='rgba(55,138,221,0.35)'; ctx.setLineDash([3,3]); ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(padL,yCog(plateau)); ctx.lineTo(padL+pw,yCog(plateau)); ctx.stroke();
+    ctx.setLineDash([]);
+    var ySnr=function(v){return padT + ph - (v/(snrMax*1.1))*ph;};
+    ctx.strokeStyle='#BA7517'; ctx.lineWidth=2.5; ctx.beginPath();
+    for(var j=0;j<radii.length;j++){var Xj=xOf(radii[j]),Yj=ySnr(snr[j]); j?ctx.lineTo(Xj,Yj):ctx.moveTo(Xj,Yj);}
+    ctx.stroke();
+    ctx.fillStyle='#BA7517';
+    ctx.beginPath(); ctx.arc(xOf(radii[bestI]),ySnr(snr[bestI]),3.5,0,2*Math.PI); ctx.fill();
+    ctx.strokeStyle='#D85A30'; ctx.setLineDash([4,3]); ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(xOf(rad),padT); ctx.lineTo(xOf(rad),padT+ph); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle=txt; ctx.font='10px sans-serif'; ctx.textAlign='center';
+    [1,6,12,18,24].forEach(function(t){ if(t<=NP) ctx.fillText(t, xOf(t), padT+ph+14); });
+    ctx.fillText('radius (px)', padL+pw/2, H-2);
+  }
+
+  function update(){
+    var rad=+radEl.value;
+    radOut.textContent=rad+' px';
+    var S=cog[rad-1], sn=snr[rad-1];
+    document.getElementById('m-flux').textContent=Math.round(S).toLocaleString()+' e\u207B';
+    document.getElementById('m-fluxpct').textContent=Math.round(100*S/plateau)+'% of total';
+    document.getElementById('m-snr').textContent=Math.round(sn);
+    document.getElementById('m-rad').textContent=rad+' px';
+    document.getElementById('m-fwhm').textContent=(rad/fwhm).toFixed(1)+'\u00D7 FWHM';
+    var note=document.getElementById('m-snrnote');
+    if(rad===radii[bestI]){ note.textContent='peak \u2014 optimal'; note.style.color='var(--ok)'; }
+    else if(sn>0.98*snrMax){ note.textContent='near peak'; note.style.color='var(--ok)'; }
+    else { note.textContent=Math.round(100*sn/snrMax)+'% of peak'; note.style.color='var(--hint)'; }
+    drawStar(rad); drawPlot(rad);
+  }
+  radEl.addEventListener('input',update);
+  update();
+})();
+</script>
+</body>
+</html>
